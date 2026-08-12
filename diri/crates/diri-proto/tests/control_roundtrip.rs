@@ -32,6 +32,7 @@ fn live_results_decode_as_typed_payloads() {
     let sessions: SessionListResult = fixture_ok(FIXTURES[1]);
     assert_eq!(sessions.sessions.len(), 2);
     assert_eq!(sessions.sessions[0].status, SessionStatus::Working);
+    assert_eq!(sessions.sessions[0].status_evidence, None);
     assert!(matches!(
         sessions.sessions[1].status,
         SessionStatus::NeedsInput(_)
@@ -85,6 +86,11 @@ fn swift_associated_value_shapes_match_real_data() {
     );
     assert_eq!(
         serde_json::from_value::<AgentKind>(json!({"agent": {"id": "amp"}})).unwrap(),
+        amp
+    );
+    // The Rust Engine's live manifest catalog uses the manifest id directly.
+    assert_eq!(
+        serde_json::from_value::<AgentKind>(json!("amp")).unwrap(),
         amp
     );
 

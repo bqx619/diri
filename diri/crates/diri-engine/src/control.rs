@@ -800,6 +800,7 @@ impl ControlServer {
         };
 
         let mut record = new_record(&id, &kind, &cwd);
+        record.kind = p.kind.clone();
         // A linked worktree is an execution cwd inside the project selected
         // by the user; it does not become a new first-level sidebar project.
         record.project_id = crate::registry::session_project_id(&p.cwd, None);
@@ -1040,6 +1041,7 @@ impl ControlServer {
         };
 
         let mut record = new_record(&id, &kind, &captured.cwd);
+        record.kind = p.kind.clone();
         record.host = Some(host.id.clone());
         record.project_id = crate::registry::session_project_id(&captured.cwd, Some(&host.id));
         record.remote_persistence = Some(persistence);
@@ -1356,6 +1358,7 @@ impl ControlServer {
             let target_id = target_host.as_ref().map(|host| host.id.clone());
             let branch = prepared.branch.clone();
             let cwd = prepared.target_repo_root.clone();
+            let worktree = prepared.target_is_worktree.then(|| cwd.clone());
             let transcript = shuttle.local_target_path.clone();
             let local = target_host.is_none();
             registry.ensure_session_project(&cwd, target_id.as_deref());
@@ -1364,7 +1367,7 @@ impl ControlServer {
                 record.cwd = cwd;
                 record.project_id =
                     crate::registry::session_project_id(&record.cwd, record.host.as_deref());
-                record.worktree_path = None;
+                record.worktree_path = worktree;
                 record.git_branch = Some(branch);
                 record.transcript_path = if local { transcript } else { None };
                 record.status = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {
@@ -1942,6 +1945,7 @@ impl ControlServer {
         let mut registry = self.registry.lock().map_err(poisoned)?;
         let id = next_session_id();
         let kind = p.entry.kind.id().to_string();
+        let prompt = p.initial_prompt.filter(|prompt| !prompt.is_empty());
         let mut record = new_record(&id, &kind, &p.entry.cwd);
         record.agent_session_id = Some(p.entry.id.clone());
         record.transcript_path = Some(p.entry.transcript_path.clone());
@@ -1961,6 +1965,19 @@ impl ControlServer {
             .into_iter()
             .find(|record| record.id.0 == id)
             .ok_or_else(|| ControlError::internal("the resumed session vanished"))?;
+        drop(registry);
+        if kind == diri_proto::AgentKind::CLAUDE_CODE_ID || prompt.is_some() {
+            let registry = Arc::clone(&self.registry);
+            let session_id = id.clone();
+            std::thread::spawn(move || {
+                prepare_agent_input(
+                    &registry,
+                    &session_id,
+                    kind == diri_proto::AgentKind::CLAUDE_CODE_ID,
+                    prompt.as_deref(),
+                );
+            });
+        }
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
     }
 
@@ -2649,6 +2666,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         agent_session_id: None,
         transcript_path: None,
         status: diri_proto::SessionStatus::Starting,
+        status_evidence: None,
         needs_input: None,
         resumability: Resumability::Live,
         parent: None,
@@ -3224,6 +3242,7 @@ mod tests {
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Idle,
+            status_evidence: None,
             needs_input: None,
             resumability: Resumability::NotResumable,
             parent: None,
@@ -3442,6 +3461,82 @@ mod tests {
                 .resolve_local_agent_executable("claude-code", "claude")
                 .expect("configured path wins"),
             configured.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn history_resume_keeps_the_identity_needed_for_another_resume() {
+        let temp = tempfile::tempdir().expect("temp");
+        let manifests = temp.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("manifests dir");
+        std::fs::write(
+            manifests.join("probe.json"),
+            json!({
+                "schemaVersion": 2,
+                "id": "probe",
+                "version": "test",
+                "statusModel": "full",
+                "agent": {
+                    "binary": "/bin/sh",
+                    "resume": { "style": "flag", "token": "-c" },
+                },
+                "rules": [],
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let (probe, _) = ManifestEngine::load_dir(&manifests).expect("load");
+        let registry = Arc::new(Mutex::new(Registry::new(
+            Arc::new(probe),
+            temp.path().join("state.json"),
+        )));
+        let server = Arc::new(
+            ControlServer::new(Arc::clone(&registry), temp.path().join("daemon.sock"))
+                .with_logs_dir(temp.path().join("logs")),
+        );
+        let transcript = temp.path().join("conversation.jsonl");
+        std::fs::write(&transcript, "{}\n").expect("transcript");
+        let kind = diri_proto::AgentKind::new("probe");
+
+        let result = ok_of(call(
+            &server,
+            diri_proto::Method::SESSION_RESUME_FROM_HISTORY,
+            Some(json!({
+                "entry": {
+                    "id": "read line",
+                    "kind": serde_json::to_value(&kind).expect("kind"),
+                    "cwd": temp.path(),
+                    "title": "Recovered conversation",
+                    "transcriptPath": transcript,
+                    "lastActiveAt": 10.0,
+                    "cwdExists": true,
+                }
+            })),
+        ));
+
+        assert_eq!(result["kind"], serde_json::to_value(&kind).expect("kind"));
+        assert_eq!(result["agentSessionID"], "read line");
+        assert_eq!(
+            result["transcriptPath"],
+            transcript.to_string_lossy().as_ref()
+        );
+        assert_eq!(result["resumability"], "live");
+
+        let id = result["id"].as_str().expect("session id").to_owned();
+        registry
+            .lock()
+            .expect("registry")
+            .terminate(&id, Duration::from_millis(100))
+            .expect("terminate resumed probe");
+        assert_eq!(
+            registry
+                .lock()
+                .expect("registry")
+                .record(&id)
+                .expect("record")
+                .resumability,
+            diri_proto::Resumability::Resumable,
+            "the recovered record must remain resumable after its live process is gone"
         );
     }
 
