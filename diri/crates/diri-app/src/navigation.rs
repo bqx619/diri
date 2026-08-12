@@ -642,18 +642,21 @@ impl NavigationOverlay {
                 .sidebar_projection()
                 .projects
                 .iter()
-                .map(|entry| entry.project.clone())
+                .map(|entry| palette::ProjectTarget {
+                    project: entry.project.clone(),
+                    host: entry.host.clone(),
+                })
                 .collect();
             let hosts = store.hosts().to_vec();
             let selected = store.selected_session().cloned();
             let default_host = store.default_spawn_host();
-            let actions = palette::actions_for_default_host(
+            let actions = palette::actions_for_catalogs(
                 store.preferences().default_agent.clone(),
-                store.agent_catalog(),
                 &projects,
                 &hosts,
                 selected.as_ref(),
                 default_host.as_deref(),
+                store.agent_catalogs(),
             );
             (actions, store.ordered_sessions())
         };
@@ -966,9 +969,11 @@ impl NavigationOverlay {
         };
         let default_name = {
             let store = self.store.read().expect("session store lock poisoned");
-            crate::agent_catalog::display_name(
-                &store.preferences().default_agent,
-                store.agent_catalog(),
+            store.agent_catalog(None).map_or_else(
+                || crate::agent_catalog::title_case_id(store.preferences().default_agent.id()),
+                |catalog| {
+                    crate::agent_catalog::display_name(&store.preferences().default_agent, catalog)
+                },
             )
         };
         let row = div()

@@ -206,6 +206,7 @@ pub enum HelperCommand {
     Gc,
     Environment,
     Directories,
+    Executables,
     Persistence,
 }
 
@@ -220,6 +221,7 @@ impl HelperCommand {
             Self::Gc => "gc",
             Self::Environment => "environment",
             Self::Directories => "directories",
+            Self::Executables => "executables",
             Self::Persistence => "persistence",
         }
     }

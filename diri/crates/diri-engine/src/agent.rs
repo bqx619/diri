@@ -481,6 +481,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_shipped_cli_agent_has_an_https_setup_url() {
+        let (engine, failed) = ManifestEngine::load_dir(&manifest_dir()).expect("load");
+        assert!(failed.is_empty(), "manifests failed to decode: {failed:?}");
+
+        let missing = engine
+            .ids()
+            .into_iter()
+            .filter(|id| {
+                engine
+                    .manifest(id)
+                    .and_then(|manifest| manifest.agent.as_ref())
+                    .is_some_and(|agent| {
+                        agent.binary.is_some()
+                            && !agent
+                                .setup
+                                .as_ref()
+                                .and_then(|setup| setup.url.as_deref())
+                                .is_some_and(|url| url.starts_with("https://"))
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "CLI Agents without setup URLs: {missing:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn wrapped_agent_really_accepts_shell_input_after_the_agent_finishes() {

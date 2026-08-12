@@ -523,7 +523,11 @@ impl DaemonClient {
         self.core
             .request_typed(
                 Method::HOST_LIST_DIRECTORIES,
-                Some(&HostListDirectoriesParams { host, path }),
+                Some(&HostListDirectoriesParams {
+                    host,
+                    path,
+                    mode: diri_proto::remote_pty::DirectoryListMode::Directories,
+                }),
                 Some(Duration::from_secs(30)),
             )
             .await
@@ -643,8 +647,18 @@ impl DaemonClient {
         self.empty(Method::GOVERNOR_CONFIGURE, &params).await
     }
 
-    pub async fn agent_readiness(&self) -> Result<AgentReadinessResult, ClientError> {
-        self.no_params(Method::AGENT_READINESS).await
+    pub async fn agent_readiness(
+        &self,
+        params: diri_proto::AgentReadinessParams,
+    ) -> Result<AgentReadinessResult, ClientError> {
+        self.typed(Method::AGENT_READINESS, &params).await
+    }
+
+    pub async fn configure_agent(
+        &self,
+        params: diri_proto::AgentConfigureParams,
+    ) -> Result<diri_proto::AgentConfigureResult, ClientError> {
+        self.typed(Method::AGENT_CONFIGURE, &params).await
     }
 
     pub async fn hibernate(&self, session_id: &SessionId) -> Result<(), ClientError> {

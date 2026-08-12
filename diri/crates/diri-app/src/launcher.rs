@@ -13,7 +13,7 @@ use gpui::{
 };
 
 use crate::AppServices;
-use crate::agent_catalog::{AgentOption, default_agent_options, title_case_id};
+use crate::agent_catalog::{AgentOption, quick_agent_options, title_case_id};
 use crate::composer::PromptComposer;
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::CARET;
@@ -58,8 +58,15 @@ const fn composer_text_height(lines: usize) -> f32 {
     visible as f32 * COMPOSER_LINE_HEIGHT + COMPOSER_PAD_TOP + COMPOSER_PAD_BOTTOM
 }
 
+#[derive(Clone)]
+struct LauncherProject {
+    project: Project,
+    host: Option<String>,
+}
+
 pub(crate) enum LauncherEvent {
     Closed,
+    ManageAgents(Option<String>),
 }
 
 pub(crate) struct LauncherOverlay {
@@ -68,6 +75,8 @@ pub(crate) struct LauncherOverlay {
     prompt: PromptComposer,
     selected_harness: AgentKind,
     selected_root: String,
+    selected_host: Option<String>,
+    fallback_notice: Option<String>,
     /// Which picker, if any, is open — and where its keyboard highlight sits,
     /// so both are reachable without the mouse.
     picker: Option<Picker>,
@@ -94,13 +103,21 @@ impl EventEmitter<LauncherEvent> for LauncherOverlay {}
 impl LauncherOverlay {
     pub(crate) fn new(services: Arc<AppServices>, preview: bool, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
-        let (selected_harness, selected_root) = initial_target(&services);
+        let (selected_harness, selected_root, selected_host) = initial_target(&services);
         let mut changes = services.store.changes();
         let store_changes = cx.spawn(async move |this, cx| {
             loop {
                 match changes.recv().await {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        if this
+                            .update(cx, |this, cx| {
+                                if this.open {
+                                    this.reconcile_harness();
+                                }
+                                cx.notify();
+                            })
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -115,6 +132,8 @@ impl LauncherOverlay {
             prompt: PromptComposer::default(),
             selected_harness,
             selected_root,
+            selected_host,
+            fallback_notice: None,
             picker: None,
             highlight: 0,
             open: false,
@@ -133,10 +152,19 @@ impl LauncherOverlay {
         // check something — threw the prompt away with no way back. It is
         // cleared on submit, and only there.
         if self.prompt.is_empty() {
-            let (harness, root) = initial_target(&self.services);
+            let (harness, root, host) = initial_target(&self.services);
             self.selected_harness = harness;
             self.selected_root = root;
+            self.selected_host = host;
+            self.fallback_notice = None;
         }
+        self.services
+            .store
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .request_agent_catalog(self.selected_host.clone(), false);
+        self.reconcile_harness();
         self.picker = None;
         self.open = true;
         window.focus(&self.focus, cx);
@@ -164,22 +192,74 @@ impl LauncherOverlay {
             .store
             .read()
             .expect("session store lock poisoned");
-        default_agent_options(store.agent_catalog())
+        quick_agent_options(store.agent_catalog(self.selected_host.as_deref()))
     }
 
-    fn projects(&self) -> Vec<Project> {
+    /// Keeps a saved default preference intact while making this invocation
+    /// usable on a target where that Agent is absent. It runs only after a
+    /// catalog exists, so an in-flight remote scan never causes a false
+    /// fallback or visual jump.
+    fn reconcile_harness(&mut self) {
+        let has_catalog = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .agent_catalog(self.selected_host.as_deref())
+            .is_some();
+        if !has_catalog {
+            return;
+        }
+        let choices = self.harness_choices();
+        if choices
+            .iter()
+            .any(|choice| choice.kind == self.selected_harness)
+        {
+            return;
+        }
+        let Some(first) = choices.first() else {
+            return;
+        };
+        let unavailable = title_case_id(self.selected_harness.id());
+        self.selected_harness = first.kind.clone();
+        self.fallback_notice = Some(format!(
+            "{unavailable} is unavailable here; using {}",
+            first.display_name
+        ));
+    }
+
+    fn projects(&self) -> Vec<LauncherProject> {
         let store = self
             .services
             .store
             .store
             .read()
             .expect("session store lock poisoned");
-        let mut projects: Vec<_> = store.projects().values().cloned().collect();
+        let mut projects: Vec<_> = store
+            .projects()
+            .values()
+            .cloned()
+            .map(|project| LauncherProject {
+                host: store
+                    .sessions()
+                    .values()
+                    .find(|session| session.project_id == project.id)
+                    .and_then(|session| session.host.clone()),
+                project,
+            })
+            .collect();
         projects.sort_by(|left, right| {
-            left.pinned_order
+            left.project
+                .pinned_order
                 .unwrap_or(i64::MAX)
-                .cmp(&right.pinned_order.unwrap_or(i64::MAX))
-                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+                .cmp(&right.project.pinned_order.unwrap_or(i64::MAX))
+                .then_with(|| {
+                    left.project
+                        .name
+                        .to_lowercase()
+                        .cmp(&right.project.name.to_lowercase())
+                })
         });
         projects
     }
@@ -195,8 +275,10 @@ impl LauncherOverlay {
     fn selected_project_label(&self) -> String {
         self.projects()
             .into_iter()
-            .find(|project| project.root == self.selected_root)
-            .map(|project| project.name)
+            .find(|project| {
+                project.project.root == self.selected_root && project.host == self.selected_host
+            })
+            .map(|project| project.project.name)
             .or_else(|| {
                 Path::new(&self.selected_root)
                     .file_name()
@@ -214,24 +296,19 @@ impl LauncherOverlay {
         if self.selected_root.is_empty() {
             return Some("Choose a project to start in".to_owned());
         }
-        match self
-            .harness_choices()
+        self.harness_choices()
             .into_iter()
-            .find(|choice| choice.kind == self.selected_harness)
-        {
-            Some(choice) if choice.available => None,
-            Some(choice) => Some(format!(
-                "{}: {}",
-                choice.display_name,
-                choice
-                    .unavailable_label()
-                    .expect("unavailable choice has a missing-binary label")
-            )),
-            None => Some(format!(
-                "{} is not available on this machine",
-                self.selected_harness_label()
-            )),
-        }
+            .any(|choice| choice.kind == self.selected_harness)
+            .then_some(())
+            .map_or_else(
+                || {
+                    Some(format!(
+                        "{} is not available on this host",
+                        self.selected_harness_label()
+                    ))
+                },
+                |_| None,
+            )
     }
 
     fn can_submit(&self) -> bool {
@@ -253,6 +330,7 @@ impl LauncherOverlay {
                 SpawnOptions {
                     cwd: Some(self.selected_root.clone()),
                     initial_prompt: Some(prompt),
+                    host: self.selected_host.clone(),
                     ..SpawnOptions::default()
                 },
             );
@@ -343,19 +421,24 @@ impl LauncherOverlay {
     fn commit_highlight(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.picker {
             Some(Picker::Harness) => {
-                if let Some(choice) = self
-                    .harness_choices()
-                    .get(self.highlight)
-                    .filter(|choice| choice.available)
-                {
+                if let Some(choice) = self.harness_choices().get(self.highlight) {
                     self.selected_harness = choice.kind.clone();
+                    self.fallback_notice = None;
                 }
             }
             Some(Picker::Project) => {
                 let projects = self.projects();
                 match project_commit(projects.len(), self.highlight) {
                     ProjectCommit::Recent(index) => {
-                        self.selected_root.clone_from(&projects[index].root);
+                        self.selected_root.clone_from(&projects[index].project.root);
+                        self.selected_host.clone_from(&projects[index].host);
+                        self.services
+                            .store
+                            .store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .request_agent_catalog(projects[index].host.clone(), false);
+                        self.reconcile_harness();
                         self.picker = None;
                         window.focus(&self.focus, cx);
                     }
@@ -380,10 +463,9 @@ impl LauncherOverlay {
                 .harness_choices()
                 .iter()
                 .position(|choice| choice.kind == self.selected_harness),
-            Picker::Project => self
-                .projects()
-                .iter()
-                .position(|project| project.root == self.selected_root),
+            Picker::Project => self.projects().iter().position(|project| {
+                project.project.root == self.selected_root && project.host == self.selected_host
+            }),
         }
         .unwrap_or(0);
         self.picker = Some(picker);
@@ -391,11 +473,7 @@ impl LauncherOverlay {
 
     /// Steps to the next installed agent, skipping any that cannot run.
     fn cycle_harness(&mut self, delta: isize) {
-        let choices: Vec<_> = self
-            .harness_choices()
-            .into_iter()
-            .filter(|choice| choice.available)
-            .collect();
+        let choices = self.harness_choices();
         if choices.is_empty() {
             return;
         }
@@ -406,6 +484,7 @@ impl LauncherOverlay {
         let count = choices.len() as isize;
         let next = (current as isize + delta).rem_euclid(count) as usize;
         self.selected_harness = choices[next].kind.clone();
+        self.fallback_notice = None;
     }
 
     fn edit_prompt(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
@@ -450,7 +529,16 @@ impl LauncherOverlay {
                 _ => None,
             };
             let _ = this.update_in(cx, |this, window, cx| {
-                apply_folder_choice(&mut this.selected_root, selected.as_deref());
+                if apply_folder_choice(&mut this.selected_root, selected.as_deref()) {
+                    this.selected_host = None;
+                    this.services
+                        .store
+                        .store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .request_agent_catalog(None, false);
+                    this.reconcile_harness();
+                }
                 window.focus(&this.focus, cx);
                 cx.notify();
             });
@@ -461,82 +549,38 @@ impl LauncherOverlay {
     fn render_harness_picker(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         let mut list = div()
             .id("launcher-harness-list")
-            .py(px(6.0))
-            .w(px(350.0))
+            .py(px(4.0))
+            .w(px(260.0))
             .max_h(px(PICKER_HEIGHT))
             .overflow_y_scroll();
         for (index, choice) in self.harness_choices().into_iter().enumerate() {
             let selected = choice.kind == self.selected_harness;
-            let enabled = choice.available;
             let highlighted = self.highlight == index;
             let kind = choice.kind.clone();
             let logo = ui_agent_kind(&choice.kind);
-            let setup_url = choice.setup_url.clone();
-            let unavailable = choice.unavailable_detail();
             list = list.child(
                 div()
                     .id(format!("launcher-harness-{index}"))
                     .mx(px(6.0))
-                    .min_h(px(48.0))
-                    .px(px(9.0))
+                    .h(px(32.0))
+                    .px(px(8.0))
                     .flex()
                     .items_center()
-                    .gap(px(9.0))
+                    .gap(px(8.0))
                     .rounded(px(8.0))
                     .text_size(px(12.0))
-                    .text_color(if enabled {
-                        colors.primary
-                    } else {
-                        colors.tertiary
-                    })
-                    .when(highlighted && enabled, |row| {
-                        row.bg(colors.primary.alpha(0.08))
-                    })
-                    .when(enabled, |row| {
-                        row.cursor_pointer()
-                            .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.selected_harness = kind.clone();
-                                this.picker = None;
-                                cx.notify();
-                            }))
-                    })
+                    .text_color(colors.primary)
+                    .when(highlighted, |row| row.bg(colors.primary.alpha(0.08)))
+                    .cursor_pointer()
+                    .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected_harness = kind.clone();
+                        this.fallback_notice = None;
+                        this.picker = None;
+                        cx.notify();
+                    }))
                     .child(AgentLogo::new(logo, 21.0, colors))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .child(choice.display_name)
-                            .when_some(unavailable, |label, unavailable| {
-                                label.child(
-                                    div()
-                                        .whitespace_nowrap()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .text_size(px(9.5))
-                                        .text_color(colors.tertiary)
-                                        .child(unavailable),
-                                )
-                            }),
-                    )
-                    .when_some(setup_url, |row, url| {
-                        row.child(
-                            div()
-                                .id(format!("launcher-harness-setup-{index}"))
-                                .px(px(6.0))
-                                .py(px(3.0))
-                                .rounded(px(Radius::CHIP))
-                                .cursor_pointer()
-                                .text_size(px(9.5))
-                                .text_color(colors.secondary)
-                                .bg(Fill::subtle(colors))
-                                .hover(move |button| button.bg(colors.primary.alpha(0.10)))
-                                .on_click(move |_, _, cx| cx.open_url(&url))
-                                .child("Setup…"),
-                        )
-                    })
+                    .child(div().flex_1().child(choice.display_name))
                     .when(selected, |row| {
                         row.child(sf_symbol_weighted(
                             "checkmark",
@@ -547,6 +591,37 @@ impl LauncherOverlay {
                     }),
             );
         }
+        let host = self.selected_host.clone();
+        list = list.child(
+            div()
+                .id("launcher-manage-agents")
+                .mt(px(4.0))
+                .mx(px(6.0))
+                .pt(px(5.0))
+                .h(px(34.0))
+                .px(px(9.0))
+                .border_t_1()
+                .border_color(colors.primary.alpha(0.07))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open = false;
+                    this.picker = None;
+                    cx.emit(LauncherEvent::ManageAgents(host.clone()));
+                    cx.notify();
+                }))
+                .child(sf_symbol("gearshape", 11.0, colors.secondary))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(colors.secondary)
+                        .child("Manage Agents…"),
+                ),
+        );
         FloatingSurface::new(colors, list).into_any_element()
     }
 
@@ -559,9 +634,11 @@ impl LauncherOverlay {
             .max_h(px(PICKER_HEIGHT))
             .overflow_y_scroll();
         for (index, project) in projects.into_iter().enumerate() {
-            let selected = project.root == self.selected_root;
+            let selected =
+                project.project.root == self.selected_root && project.host == self.selected_host;
             let highlighted = self.highlight == index;
-            let root = project.root.clone();
+            let root = project.project.root.clone();
+            let host = project.host.clone();
             list = list.child(
                 div()
                     .id(format!("launcher-project-{index}"))
@@ -578,6 +655,14 @@ impl LauncherOverlay {
                     .hover(move |row| row.bg(colors.primary.alpha(0.06)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_root.clone_from(&root);
+                        this.selected_host.clone_from(&host);
+                        this.services
+                            .store
+                            .store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .request_agent_catalog(host.clone(), false);
+                        this.reconcile_harness();
                         this.picker = None;
                         cx.notify();
                     }))
@@ -593,7 +678,7 @@ impl LauncherOverlay {
                                 div()
                                     .text_size(px(12.0))
                                     .text_color(colors.primary)
-                                    .child(project.name),
+                                    .child(project.project.name),
                             )
                             .child(
                                 div()
@@ -601,7 +686,7 @@ impl LauncherOverlay {
                                     .text_color(colors.tertiary)
                                     .whitespace_nowrap()
                                     .overflow_hidden()
-                                    .child(project.root),
+                                    .child(project.project.root),
                             ),
                     )
                     .when(selected, |row| {
@@ -799,9 +884,14 @@ impl LauncherOverlay {
                                         div()
                                             .text_size(px(10.0))
                                             .text_color(colors.tertiary)
-                                            .child(blocker.clone().unwrap_or_else(|| {
-                                                "⇧↵  New line   ⇥  Agent".to_owned()
-                                            })),
+                                            .child(
+                                                blocker
+                                                    .clone()
+                                                    .or_else(|| self.fallback_notice.clone())
+                                                    .unwrap_or_else(|| {
+                                                        "⇧↵  New line   ⇥  Agent".to_owned()
+                                                    }),
+                                            ),
                                     ),
                             )
                             .child(
@@ -1032,25 +1122,40 @@ impl Render for LauncherOverlay {
     }
 }
 
-fn initial_target(services: &AppServices) -> (AgentKind, String) {
+fn initial_target(services: &AppServices) -> (AgentKind, String, Option<String>) {
     let store = services
         .store
         .store
         .read()
         .expect("session store lock poisoned");
-    let selected_root = store
+    let selected = store
         .selected_session()
-        .and_then(|session| store.projects().get(&session.project_id))
-        .map(|project| project.root.clone())
+        .and_then(|session| {
+            store
+                .projects()
+                .get(&session.project_id)
+                .map(|project| (project.root.clone(), session.host.clone()))
+        })
         .or_else(|| {
             store
                 .projects()
                 .values()
                 .min_by(|left, right| left.name.cmp(&right.name))
-                .map(|project| project.root.clone())
+                .map(|project| {
+                    let host = store
+                        .sessions()
+                        .values()
+                        .find(|session| session.project_id == project.id)
+                        .and_then(|session| session.host.clone());
+                    (project.root.clone(), host)
+                })
         })
         .unwrap_or_default();
-    (store.preferences().default_agent.clone(), selected_root)
+    (
+        store.preferences().default_agent.clone(),
+        selected.0,
+        selected.1,
+    )
 }
 
 fn ui_agent_kind(kind: &AgentKind) -> UiAgentKind {

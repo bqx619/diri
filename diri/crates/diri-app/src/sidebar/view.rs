@@ -44,6 +44,7 @@ pub enum SidebarEvent {
     /// The title-bar gear is a settings affordance. RootView owns the settings
     /// surface, so the sidebar requests it instead of opening its account menu.
     OpenSettings,
+    OpenAgentSettings(Option<String>),
     /// One-click path from the footer menu into the Remote host editor.
     AddRemoteHost,
     /// A plain click (or shortcut) selected a session: hand keyboard focus
@@ -510,9 +511,11 @@ impl Sidebar {
         let hovering = self.ui.hovered_control == Some("new-agent");
         let (agent, location) = {
             let store = self.store.read().expect("session store lock poisoned");
-            let agent = crate::agent_catalog::display_name(
-                &store.preferences().default_agent,
-                store.agent_catalog(),
+            let agent = store.agent_catalog(None).map_or_else(
+                || crate::agent_catalog::title_case_id(store.preferences().default_agent.id()),
+                |catalog| {
+                    crate::agent_catalog::display_name(&store.preferences().default_agent, catalog)
+                },
             );
             let location = store
                 .default_spawn_host()
@@ -1817,6 +1820,12 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        {
+            let mut store = self.store.write().expect("session store lock poisoned");
+            if store.agent_catalog(host.as_deref()).is_none() {
+                store.request_agent_catalog(host.clone(), false);
+            }
+        }
         let (local_target, default_kind, hosts, active_session, repo_state, syncing, options) = {
             let store = self.store.read().expect("session store lock poisoned");
             let selected_host_id = host.as_deref();
@@ -1829,7 +1838,7 @@ impl Sidebar {
                 store.selected_session().cloned(),
                 store.repo_target(selected_host_id).cloned(),
                 store.syncing_prefs().clone(),
-                agent_picker_options(store.agent_catalog()),
+                agent_picker_options(store.agent_catalog(host.as_deref())),
             )
         };
         let selected_host = host
@@ -2061,6 +2070,10 @@ impl Sidebar {
                                 .write()
                                 .expect("session store lock poisoned")
                                 .set_default_spawn_host(target_host.clone());
+                            this.store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .request_agent_catalog(target_host.clone(), false);
                             // Only remote -> local needs a matching checkout.
                             // A remote destination starts at its configured cwd.
                             if should_resolve_active_repo(
@@ -2179,11 +2192,10 @@ impl Sidebar {
                     .mx(px(6.0))
                     .my(px(1.0))
                     .px(px(8.0))
-                    .min_h(px(42.0))
-                    .py(px(4.0))
+                    .h(px(32.0))
                     .flex()
                     .items_center()
-                    .gap(px(10.0))
+                    .gap(px(8.0))
                     .rounded(px(Radius::ROW))
                     .when(available, |row| {
                         row.cursor_pointer()
@@ -2270,6 +2282,33 @@ impl Sidebar {
                     }),
             );
         }
+        let manage_host = selected_host.as_ref().map(|host| host.id.clone());
+        content = content.child(HairlineDivider::horizontal(colors)).child(
+            div()
+                .id("manage-agents")
+                .mx(px(6.0))
+                .my(px(1.0))
+                .px(px(8.0))
+                .h(px(32.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(Radius::ROW))
+                .cursor_pointer()
+                .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.ui.popover = None;
+                    cx.emit(SidebarEvent::OpenAgentSettings(manage_host.clone()));
+                    cx.notify();
+                }))
+                .child(sf_symbol("gearshape", 11.0, colors.secondary))
+                .child(
+                    div()
+                        .text_size(px(Typo::ROW.size))
+                        .text_color(colors.secondary)
+                        .child("Manage Agents…"),
+                ),
+        );
         self.popover_shell(70.0, content.pb(px(6.0)), colors, cx)
     }
 
@@ -3840,10 +3879,9 @@ fn status_state(session: &SessionRecord, migrating: bool) -> StatusState {
     }
 }
 
-/// Rows for the new-agent picker come wholly from the runtime catalog. Local
-/// unavailable rows stay visible with the same missing-binary/setup guidance
-/// as the launcher; remote rows stay launchable because local readiness cannot
-/// describe the selected host.
+/// Rows for the new-agent picker come from the selected target's runtime
+/// catalog. Unavailable and user-hidden Agents stay out of this high-frequency
+/// surface; Settings remains the complete supported-Agent inventory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AgentPickerOption {
     title: String,
@@ -3855,24 +3893,24 @@ struct AgentPickerOption {
     unavailable_detail: Option<String>,
 }
 
-fn agent_picker_options(catalog: &diri_proto::AgentReadinessResult) -> Vec<AgentPickerOption> {
-    let mut options: Vec<_> = crate::agent_catalog::agent_options(catalog)
+fn agent_picker_options(
+    catalog: Option<&diri_proto::AgentReadinessResult>,
+) -> Vec<AgentPickerOption> {
+    let mut options: Vec<_> = crate::agent_catalog::quick_agent_options(catalog)
         .into_iter()
-        .map(|option| {
-            let unavailable_detail = option.unavailable_detail();
-            AgentPickerOption {
-                title: option.display_name,
-                shortcut: if option.kind == ProtoAgentKind::CODEX {
-                    "⌘⇧N"
-                } else {
-                    ""
-                },
-                kind: option.kind,
-                binary: option.binary,
-                available: option.available,
-                setup_url: option.setup_url,
-                unavailable_detail,
-            }
+        .filter(|option| option.kind != ProtoAgentKind::SHELL)
+        .map(|option| AgentPickerOption {
+            title: option.display_name,
+            shortcut: if option.kind == ProtoAgentKind::CODEX {
+                "⌘⇧N"
+            } else {
+                ""
+            },
+            kind: option.kind,
+            binary: option.binary,
+            available: true,
+            setup_url: None,
+            unavailable_detail: None,
         })
         .collect();
     // Terminal is last on purpose: it is the escape hatch, not an agent.
@@ -4104,18 +4142,20 @@ mod tests {
     }
 
     #[test]
-    fn agent_picker_keeps_manifest_only_and_unavailable_guidance_rows() {
+    fn agent_picker_keeps_installed_manifest_agents_and_hides_unavailable_rows() {
         let catalog = diri_proto::AgentReadinessResult {
             agents: vec![
                 diri_proto::AgentReadinessItem {
                     kind: ProtoAgentKind::new("amp"),
                     binary: "amp".into(),
                     path: Some("/bin/amp".into()),
+                    show_in_quick_create: true,
                     descriptor: Some(diri_proto::AgentDescriptor {
                         id: "amp".into(),
                         display_name: "Amp".into(),
                         ..diri_proto::AgentDescriptor::default()
                     }),
+                    ..diri_proto::AgentReadinessItem::default()
                 },
                 diri_proto::AgentReadinessItem {
                     kind: ProtoAgentKind::new("opencode"),
@@ -4131,28 +4171,21 @@ mod tests {
                         }),
                         ..diri_proto::AgentDescriptor::default()
                     }),
+                    ..diri_proto::AgentReadinessItem::default()
                 },
             ],
+            ..diri_proto::AgentReadinessResult::default()
         };
-        let options = agent_picker_options(&catalog);
+        let options = agent_picker_options(Some(&catalog));
         let amp = options
             .iter()
             .find(|option| option.kind == ProtoAgentKind::new("amp"))
             .expect("manifest-only option");
         assert!(amp.available);
-        let opencode = options
-            .iter()
-            .find(|option| option.kind == ProtoAgentKind::new("opencode"))
-            .expect("unavailable option remains visible");
-        assert!(!opencode.available);
-        assert_eq!(opencode.binary, "opencode");
-        assert_eq!(
-            opencode.unavailable_detail.as_deref(),
-            Some("Missing opencode · Install OpenCode. · Run /connect.")
-        );
-        assert_eq!(
-            opencode.setup_url.as_deref(),
-            Some("https://opencode.ai/docs")
+        assert!(
+            !options
+                .iter()
+                .any(|option| option.kind == ProtoAgentKind::new("opencode"))
         );
     }
 
@@ -4277,7 +4310,37 @@ mod tests {
     #[gpui::test]
     fn project_plus_opens_the_agent_kind_menu_in_that_project(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| {
-            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            let sidebar = cx.new(|cx| {
+                let sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                let installed =
+                    |kind: diri_proto::AgentKind, label: &str| diri_proto::AgentReadinessItem {
+                        binary: kind.id().to_owned(),
+                        kind,
+                        path: Some(format!("/usr/local/bin/{label}")),
+                        detected_path: None,
+                        configured_path: None,
+                        path_source: Some(diri_proto::AgentPathSource::SystemPath),
+                        show_in_quick_create: true,
+                        error: None,
+                        descriptor: Some(diri_proto::AgentDescriptor {
+                            display_name: label.to_owned(),
+                            ..Default::default()
+                        }),
+                    };
+                sidebar
+                    .store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .set_agent_catalog(diri_proto::AgentReadinessResult {
+                        host: None,
+                        scanned_at: None,
+                        agents: vec![
+                            installed(diri_proto::AgentKind::CLAUDE_CODE, "Claude Code"),
+                            installed(diri_proto::AgentKind::CODEX, "Codex"),
+                        ],
+                    });
+                sidebar
+            });
             SidebarPopoverHarness { sidebar }
         });
         let project = cx

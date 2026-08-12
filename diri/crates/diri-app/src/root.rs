@@ -275,6 +275,13 @@ impl RootView {
             {
                 surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
             }
+            if let SidebarEvent::OpenAgentSettings(host) = event
+                && let Some(surfaces) = &this.utility_surfaces
+            {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.open_agent_settings(host.clone(), cx);
+                });
+            }
             if matches!(event, SidebarEvent::AddRemoteHost)
                 && let Some(surfaces) = &this.utility_surfaces
             {
@@ -291,7 +298,14 @@ impl RootView {
         cx.subscribe_in(
             &launcher,
             window,
-            |this, _, _: &LauncherEvent, window, cx| {
+            |this, _, event: &LauncherEvent, window, cx| {
+                if let LauncherEvent::ManageAgents(host) = event
+                    && let Some(surfaces) = &this.utility_surfaces
+                {
+                    surfaces.update(cx, |surfaces, cx| {
+                        surfaces.open_agent_settings(host.clone(), cx);
+                    });
+                }
                 if let Some(terminal) = &this.terminal {
                     terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
                 } else {
@@ -683,7 +697,7 @@ impl RootView {
             key @ ("t" | "n") => match new_session_shortcut(key, event.keystroke.modifiers) {
                 Some(NewSessionShortcut::Default) => {
                     if !self.spawn_default() {
-                        return;
+                        self.open_launcher(&OpenLauncher, _window, cx);
                     }
                 }
                 Some(NewSessionShortcut::Shell) => {
@@ -693,7 +707,7 @@ impl RootView {
                 }
                 Some(NewSessionShortcut::Codex) => {
                     if !self.spawn(Some(AgentKind::CODEX)) {
-                        return;
+                        self.open_launcher(&OpenLauncher, _window, cx);
                     }
                 }
                 None => return,
@@ -814,6 +828,14 @@ impl RootView {
         match agent {
             Some(agent) => {
                 let host = store.default_spawn_host();
+                let available =
+                    crate::agent_catalog::quick_agent_options(store.agent_catalog(host.as_deref()))
+                        .iter()
+                        .any(|item| item.kind == agent);
+                if !available {
+                    store.request_agent_catalog(host, false);
+                    return false;
+                }
                 store.spawn_kind(
                     agent,
                     SpawnOptions {
@@ -831,12 +853,29 @@ impl RootView {
         if self.preview {
             return false;
         }
-        self.services
+        let mut store = self
+            .services
             .store
             .store
             .write()
-            .expect("session store lock poisoned")
-            .spawn_default(SpawnOptions::default());
+            .expect("session store lock poisoned");
+        let host = store.default_spawn_host();
+        let kind = store.preferences().default_agent.clone();
+        let available =
+            crate::agent_catalog::quick_agent_options(store.agent_catalog(host.as_deref()))
+                .iter()
+                .any(|agent| agent.kind == kind);
+        if !available {
+            store.request_agent_catalog(host, false);
+            return false;
+        }
+        store.spawn_kind(
+            kind,
+            SpawnOptions {
+                host,
+                ..SpawnOptions::default()
+            },
+        );
         true
     }
 

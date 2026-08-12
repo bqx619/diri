@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
-use crate::settings::{HostDraft, SettingsTab, default_agent_label, theme};
+use crate::settings::{HostDraft, SettingsTab, theme};
 use crate::store::{Prefs, SessionStore, StoreRuntime};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
 use crate::worktrees::WorktreesSheet;
@@ -20,8 +20,8 @@ use diri_ui::{
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, Pixels, Render, Rgba, SharedString, Task, TextRun,
-    Window, actions, canvas, deferred, div, font, prelude::*, px, rgba,
+    IntoElement, KeyDownEvent, MouseButton, PathPromptOptions, Pixels, Render, Rgba, SharedString,
+    Task, TextRun, Window, actions, canvas, deferred, div, font, prelude::*, px, rgba,
 };
 use tokio::runtime::Runtime;
 
@@ -131,6 +131,14 @@ struct HostEditor {
     active_field: HostFormField,
     error: Option<String>,
     confirm_remove: bool,
+}
+
+struct AgentPathEditor {
+    kind: ProtoAgentKind,
+    host: Option<String>,
+    path: QueryEditor,
+    show_in_quick_create: bool,
+    error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -260,6 +268,8 @@ pub struct UtilitySurfaces {
     worktrees: WorktreesSheet,
     settings_tab: SettingsTab,
     settings_menu: Option<SettingsMenu>,
+    agents_host: Option<String>,
+    agent_path_editor: Option<AgentPathEditor>,
     hosts_path: PathBuf,
     hosts: Vec<HostEntry>,
     host_editor: Option<HostEditor>,
@@ -289,18 +299,23 @@ impl UtilitySurfaces {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let hosts_path = diri_proto::paths::DirijorPaths::hosts_config_file(&home);
-        let (prefs, hosts) = {
+        let (prefs, hosts, agents_host) = {
             let store = store_runtime
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            (store.preferences().clone(), store.hosts().to_vec())
+            (
+                store.preferences().clone(),
+                store.hosts().to_vec(),
+                store.default_spawn_host(),
+            )
         };
         let settings_preview = std::env::var("DIRI_SETTINGS_PREVIEW")
             .ok()
             .map(|value| value.to_ascii_lowercase());
         let settings_tab = match settings_preview.as_deref() {
             Some("terminal") => SettingsTab::Terminal,
+            Some("agents") => SettingsTab::Agents,
             Some("resources") => SettingsTab::Resources,
             Some("remote") => SettingsTab::Remote,
             _ => SettingsTab::General,
@@ -349,6 +364,8 @@ impl UtilitySurfaces {
             worktrees: WorktreesSheet::default(),
             settings_tab,
             settings_menu: None,
+            agents_host,
+            agent_path_editor: None,
             hosts_path,
             hosts,
             host_editor: None,
@@ -659,6 +676,10 @@ impl UtilitySurfaces {
                 }
                 match outcome {
                     Ok(result) => {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .request_agent_catalog(Some(host.id.clone()), true);
                         this.activity = match kind {
                             HostPreparationKind::Initialize => {
                                 format!("{} is ready", host.display_name())
@@ -860,6 +881,72 @@ impl UtilitySurfaces {
         true
     }
 
+    fn handle_agent_path_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::Agents
+            || self.agent_path_editor.is_none()
+        {
+            return false;
+        }
+        let key = &event.keystroke;
+        match key.key.as_str() {
+            "escape" => {
+                self.agent_path_editor = None;
+                cx.notify();
+            }
+            "enter" => {
+                let Some(editor) = &self.agent_path_editor else {
+                    return true;
+                };
+                let path = editor.path.text().trim();
+                if path.is_empty() {
+                    if let Some(editor) = &mut self.agent_path_editor {
+                        editor.error = Some("Enter an executable path.".into());
+                    }
+                } else {
+                    self.store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .configure_agent(diri_proto::AgentConfigureParams {
+                            host: editor.host.clone(),
+                            kind: editor.kind.clone(),
+                            executable_path: Some(path.to_owned()),
+                            show_in_quick_create: editor.show_in_quick_create,
+                        });
+                    self.agent_path_editor = None;
+                }
+                cx.notify();
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(key) else {
+                    return false;
+                };
+                let Some(editor) = &mut self.agent_path_editor else {
+                    return false;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        editor.path.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&editor.path, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut editor.path, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            editor.path.insert(&text);
+                        }
+                    }
+                }
+                editor.error = None;
+                cx.notify();
+            }
+        }
+        true
+    }
+
     fn visible_history(&self) -> Vec<HistoryEntry> {
         self.history
             .iter()
@@ -898,6 +985,7 @@ impl UtilitySurfaces {
             self.surface = Surface::None;
             self.settings_menu = None;
             self.host_editor = None;
+            self.agent_path_editor = None;
         }
         cx.notify();
     }
@@ -916,6 +1004,18 @@ impl UtilitySurfaces {
         self.surface = Surface::Settings;
         self.settings_menu = None;
         self.host_editor = None;
+        self.agent_path_editor = None;
+        cx.notify();
+    }
+
+    pub(crate) fn open_agent_settings(&mut self, host: Option<String>, cx: &mut Context<Self>) {
+        self.open_settings(cx);
+        self.settings_tab = SettingsTab::Agents;
+        self.agents_host = host.clone();
+        self.store
+            .write()
+            .expect("session store lock poisoned")
+            .request_agent_catalog(host, false);
         cx.notify();
     }
 
@@ -943,7 +1043,7 @@ impl UtilitySurfaces {
         if self.surface == Surface::None {
             return;
         }
-        if self.handle_host_editor_key(event, cx) {
+        if self.handle_agent_path_key(event, cx) || self.handle_host_editor_key(event, cx) {
             return;
         }
         let key = &event.keystroke;
@@ -1365,8 +1465,14 @@ impl UtilitySurfaces {
                         this.settings_tab = tab;
                         this.settings_menu = None;
                         this.host_editor = None;
+                        this.agent_path_editor = None;
                         if tab == SettingsTab::Remote {
                             this.reload_hosts();
+                        } else if tab == SettingsTab::Agents {
+                            this.store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .request_agent_catalog(this.agents_host.clone(), false);
                         }
                         cx.notify();
                     }))
@@ -1394,6 +1500,7 @@ impl UtilitySurfaces {
             .collect::<Vec<_>>();
         let pane = match self.settings_tab {
             SettingsTab::General => self.general_settings(cx).into_any_element(),
+            SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
@@ -1630,18 +1737,473 @@ impl UtilitySurfaces {
         )
     }
 
-    fn default_agent_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn agents_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
-        let (selected, catalog) = {
+        let host = self.agents_host.clone();
+        let (catalog, loading, error, hosts) = {
             let store = self.store.read().expect("session store lock poisoned");
             (
-                store.preferences().default_agent.clone(),
-                store.agent_catalog().clone(),
+                store.agent_catalog(host.as_deref()).cloned(),
+                store.agent_catalog_is_loading(host.as_deref()),
+                store
+                    .agent_catalog_error(host.as_deref())
+                    .map(str::to_owned),
+                store.hosts().to_vec(),
             )
         };
+        let mut targets = div().p(px(8.0)).flex().flex_wrap().gap(px(6.0));
+        let mut choices = vec![(None, "This Mac".to_owned(), "desktopcomputer")];
+        choices.extend(hosts.iter().map(|entry| {
+            (
+                Some(entry.id.clone()),
+                entry.display_name().to_owned(),
+                "network",
+            )
+        }));
+        for (index, (target, label, symbol)) in choices.into_iter().enumerate() {
+            let selected = target == host;
+            targets = targets.child(
+                div()
+                    .id(format!("agent-target-{index}"))
+                    .h(px(28.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .rounded(px(Radius::CHIP))
+                    .border_1()
+                    .border_color(colors.primary.alpha(if selected { 0.18 } else { 0.07 }))
+                    .bg(Fill::selected(colors, selected))
+                    .cursor_pointer()
+                    .hover(move |row| row.bg(colors.primary.alpha(0.07)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.agents_host.clone_from(&target);
+                        this.agent_path_editor = None;
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .request_agent_catalog(target.clone(), false);
+                        cx.notify();
+                    }))
+                    .child(sf_symbol(symbol, 10.0, colors.secondary))
+                    .child(div().text_size(px(11.0)).child(label)),
+            );
+        }
+
+        let mut catalog_rows = div().flex().flex_col();
+        if let Some(catalog) = catalog {
+            let agent_count = catalog.agents.len();
+            for (index, item) in catalog.agents.into_iter().enumerate() {
+                catalog_rows = catalog_rows.child(self.agent_settings_row(index, item, colors, cx));
+                if index + 1 < agent_count {
+                    catalog_rows = catalog_rows.child(setting_divider(colors));
+                }
+            }
+        } else if loading {
+            catalog_rows = catalog_rows.child(empty_label("Checking installed Agents…", colors));
+        } else {
+            catalog_rows = catalog_rows.child(empty_label(
+                "Agent detection has not run for this host.",
+                colors,
+            ));
+        }
+        if let Some(error) = error {
+            catalog_rows = catalog_rows.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(9.0))
+                    .whitespace_normal()
+                    .text_size(px(11.0))
+                    .text_color(Ink::DANGER)
+                    .child(error),
+            );
+        }
+        if let Some(editor) = &self.agent_path_editor {
+            catalog_rows = catalog_rows.child(self.agent_path_editor_row(editor, colors, cx));
+        }
+
+        let refresh_host = host.clone();
+        settings_page(
+            "Agents",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(SETTINGS_SECTION_GAP))
+                .child(setting_section("Execution target", targets, colors))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(colors.tertiary)
+                                .child("Detected from the account login PATH."),
+                        )
+                        .child(surface_button(
+                            if loading { "Checking…" } else { "Refresh" },
+                            "refresh-agent-catalog",
+                            colors,
+                            cx,
+                            move |this, cx| {
+                                this.store
+                                    .write()
+                                    .expect("session store lock poisoned")
+                                    .request_agent_catalog(refresh_host.clone(), true);
+                                cx.notify();
+                            },
+                        )),
+                )
+                .child(setting_section("Supported Agents", catalog_rows, colors)),
+            colors,
+        )
+    }
+
+    fn agent_settings_row(
+        &self,
+        index: usize,
+        item: diri_proto::AgentReadinessItem,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = item
+            .descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.display_name.clone())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| item.kind.id().to_owned());
+        let path = item.path.clone().unwrap_or_else(|| "Not found".into());
+        let status = match item.path_source {
+            Some(diri_proto::AgentPathSource::Manual) => "Manual",
+            Some(diri_proto::AgentPathSource::SystemPath) => "Installed",
+            None => "Not found",
+        };
+        let status_color = if item.available() {
+            Ink::FRESH
+        } else {
+            colors.tertiary
+        };
+        let host = self.agents_host.clone();
+        let toggle_kind = item.kind.clone();
+        let toggle_path = item.configured_path.clone();
+        let show = item.show_in_quick_create;
+        let mut actions = div().flex_none().flex().items_center().gap(px(6.0));
+        if item.available() {
+            actions = actions.child(
+                div()
+                    .id(format!("agent-quick-toggle-{index}"))
+                    .h(px(24.0))
+                    .px(px(7.0))
+                    .rounded(px(Radius::CHIP))
+                    .bg(if show {
+                        Ink::FRESH.alpha(0.12)
+                    } else {
+                        colors.primary.alpha(0.06)
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .configure_agent(diri_proto::AgentConfigureParams {
+                                host: host.clone(),
+                                kind: toggle_kind.clone(),
+                                executable_path: toggle_path.clone(),
+                                show_in_quick_create: !show,
+                            });
+                        cx.notify();
+                    }))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(sf_symbol(
+                        if show {
+                            "checkmark.circle.fill"
+                        } else {
+                            "circle"
+                        },
+                        10.0,
+                        if show { Ink::FRESH } else { colors.tertiary },
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(colors.secondary)
+                            .child("Quick"),
+                    ),
+            );
+        }
+        if let Some(url) = item
+            .descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.setup.as_ref())
+            .and_then(|setup| setup.url.as_deref())
+            .and_then(crate::agent_catalog::normal_web_url)
+        {
+            actions = actions.child(
+                div()
+                    .id(format!("agent-website-{index}"))
+                    .size(px(24.0))
+                    .rounded(px(Radius::CHIP))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .child(sf_symbol("arrow.up.right.square", 10.0, colors.secondary)),
+            );
+        }
+        let edit_kind = item.kind.clone();
+        let edit_path = item.configured_path.clone().unwrap_or_default();
+        let edit_host = self.agents_host.clone();
+        let edit_show = !item.available() || item.show_in_quick_create;
+        actions = actions.child(
+            div()
+                .id(format!("agent-bind-{index}"))
+                .h(px(24.0))
+                .px(px(7.0))
+                .rounded(px(Radius::CHIP))
+                .bg(colors.primary.alpha(0.06))
+                .cursor_pointer()
+                .hover(move |button| button.bg(colors.primary.alpha(0.09)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if edit_host.is_none() {
+                        let paths = cx.prompt_for_paths(PathPromptOptions {
+                            files: true,
+                            directories: false,
+                            multiple: false,
+                            prompt: Some("Choose Agent Executable".into()),
+                        });
+                        let kind = edit_kind.clone();
+                        cx.spawn_in(window, async move |this, cx| {
+                            let Ok(Ok(Some(mut paths))) = paths.await else {
+                                return;
+                            };
+                            let Some(path) = paths.pop() else {
+                                return;
+                            };
+                            let _ = this.update_in(cx, |this, _, cx| {
+                                this.store
+                                    .write()
+                                    .expect("session store lock poisoned")
+                                    .configure_agent(diri_proto::AgentConfigureParams {
+                                        host: None,
+                                        kind: kind.clone(),
+                                        executable_path: Some(path.to_string_lossy().into_owned()),
+                                        show_in_quick_create: edit_show,
+                                    });
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    } else {
+                        this.agent_path_editor = Some(AgentPathEditor {
+                            kind: edit_kind.clone(),
+                            host: edit_host.clone(),
+                            path: text_editor(&edit_path),
+                            show_in_quick_create: edit_show,
+                            error: None,
+                        });
+                        cx.notify();
+                    }
+                }))
+                .flex()
+                .items_center()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(colors.secondary)
+                        .child(if item.available() { "Change" } else { "Add…" }),
+                ),
+        );
+        if item.configured_path.is_some() {
+            let reset_host = self.agents_host.clone();
+            let reset_kind = item.kind.clone();
+            let reset_show = item.show_in_quick_create;
+            actions = actions.child(
+                div()
+                    .id(format!("agent-reset-{index}"))
+                    .size(px(24.0))
+                    .rounded(px(Radius::CHIP))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .configure_agent(diri_proto::AgentConfigureParams {
+                                host: reset_host.clone(),
+                                kind: reset_kind.clone(),
+                                executable_path: None,
+                                show_in_quick_create: reset_show,
+                            });
+                        cx.notify();
+                    }))
+                    .child(sf_symbol("arrow.uturn.backward", 10.0, colors.secondary)),
+            );
+        }
+
+        div()
+            .id(format!("agent-settings-row-{index}"))
+            .min_h(px(58.0))
+            .px(px(12.0))
+            .py(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .child(AgentLogo::new(ui_agent(&item.kind), 22.0, colors).badged(false))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(colors.primary)
+                                    .child(label),
+                            )
+                            .child(colored_status_badge(status, status_color)),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(10.0))
+                            .text_color(if item.error.is_some() {
+                                Ink::DANGER
+                            } else {
+                                colors.tertiary
+                            })
+                            .child(item.error.unwrap_or(path)),
+                    ),
+            )
+            .child(actions)
+            .into_any_element()
+    }
+
+    fn agent_path_editor_row(
+        &self,
+        editor: &AgentPathEditor,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div()
+            .px(px(12.0))
+            .py(px(10.0))
+            .border_t_1()
+            .border_color(colors.primary.alpha(0.06))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(colors.secondary)
+                    .child("Remote executable path (absolute or ~/…)"),
+            )
+            .child(
+                div()
+                    .h(px(30.0))
+                    .px(px(8.0))
+                    .rounded(px(Radius::CHIP))
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.14))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.0))
+                    .text_color(colors.primary)
+                    .child(query_label(&editor.path)),
+            );
+        if let Some(error) = &editor.error {
+            row = row.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(Ink::DANGER)
+                    .child(error.clone()),
+            );
+        }
+        row.child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(px(7.0))
+                .child(surface_button(
+                    "Cancel",
+                    "cancel-agent-path",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        this.agent_path_editor = None;
+                        cx.notify();
+                    },
+                ))
+                .child(surface_button(
+                    "Save Path",
+                    "save-agent-path",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        let Some(editor) = &this.agent_path_editor else {
+                            return;
+                        };
+                        let path = editor.path.text().trim();
+                        if path.is_empty() {
+                            if let Some(editor) = &mut this.agent_path_editor {
+                                editor.error = Some("Enter an executable path.".into());
+                            }
+                            cx.notify();
+                            return;
+                        }
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .configure_agent(diri_proto::AgentConfigureParams {
+                                host: editor.host.clone(),
+                                kind: editor.kind.clone(),
+                                executable_path: Some(path.to_owned()),
+                                show_in_quick_create: editor.show_in_quick_create,
+                            });
+                        this.agent_path_editor = None;
+                        cx.notify();
+                    },
+                )),
+        )
+        .into_any_element()
+    }
+
+    fn default_agent_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let selected = self.prefs.default_agent.clone();
+        let agents = {
+            let store = self.store.read().expect("session store lock poisoned");
+            crate::agent_catalog::installed_agent_options(
+                store.agent_catalog(store.default_spawn_host().as_deref()),
+            )
+        };
+        let selected_label = agents
+            .iter()
+            .find(|agent| agent.kind == selected)
+            .map(|agent| agent.display_name.clone())
+            .unwrap_or_else(|| crate::agent_catalog::title_case_id(selected.id()));
         let open = self.settings_menu == Some(SettingsMenu::DefaultAgent);
         let trigger = settings_select_button(
-            default_agent_label(&selected, &catalog),
+            selected_label,
             "default-agent-dropdown",
             open,
             SettingsMenu::DefaultAgent,
@@ -1652,15 +2214,9 @@ impl UtilitySurfaces {
         let mut control = div().relative().min_w(px(154.0)).child(trigger);
         if open {
             let mut options = div().p(px(4.0)).flex().flex_col();
-            for (index, option) in crate::agent_catalog::default_agent_options(&catalog)
-                .into_iter()
-                .enumerate()
-            {
+            for (index, option) in agents.into_iter().enumerate() {
                 let is_selected = option.kind == selected;
-                let enabled = option.available;
                 let agent = option.kind.clone();
-                let setup_url = option.setup_url.clone();
-                let unavailable = option.unavailable_detail();
                 options = options.child(
                     div()
                         .id(SharedString::from(format!("default-agent-option-{index}")))
@@ -1672,16 +2228,14 @@ impl UtilitySurfaces {
                         .gap(px(8.0))
                         .rounded(px(Radius::ROW))
                         .bg(Fill::selected(colors, is_selected))
-                        .when(enabled, |row| {
-                            row.cursor_pointer()
-                                .hover(move |style| style.bg(colors.primary.alpha(0.08)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.prefs.default_agent = agent.clone();
-                                    this.settings_menu = None;
-                                    this.persist_prefs();
-                                    cx.notify();
-                                }))
-                        })
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.prefs.default_agent = agent.clone();
+                            this.settings_menu = None;
+                            this.persist_prefs();
+                            cx.notify();
+                        }))
                         .child(AgentLogo::new(ui_agent(&option.kind), 16.0, colors).badged(false))
                         .child(
                             div()
@@ -1690,40 +2244,9 @@ impl UtilitySurfaces {
                                 .flex()
                                 .flex_col()
                                 .text_size(px(Typo::ROW.size))
-                                .text_color(if enabled {
-                                    colors.primary
-                                } else {
-                                    colors.secondary
-                                })
-                                .child(option.display_name)
-                                .when_some(unavailable, |label, unavailable| {
-                                    label.child(
-                                        div()
-                                            .whitespace_nowrap()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .text_size(px(Typo::META.size))
-                                            .text_color(colors.tertiary)
-                                            .child(unavailable),
-                                    )
-                                }),
+                                .text_color(colors.primary)
+                                .child(option.display_name),
                         )
-                        .when_some(setup_url, |row, url| {
-                            row.child(
-                                div()
-                                    .id(format!("default-agent-setup-{index}"))
-                                    .px(px(6.0))
-                                    .py(px(3.0))
-                                    .rounded(px(Radius::CHIP))
-                                    .cursor_pointer()
-                                    .text_size(px(Typo::META.size))
-                                    .text_color(colors.secondary)
-                                    .bg(Fill::subtle(colors))
-                                    .hover(move |button| button.bg(colors.primary.alpha(0.10)))
-                                    .on_click(move |_, _, cx| cx.open_url(&url))
-                                    .child("Setup…"),
-                            )
-                        })
                         .when(is_selected, |row| {
                             row.child(sf_symbol_weighted(
                                 "checkmark",
@@ -3504,6 +4027,10 @@ fn colored_badge(label: &'static str, color: Rgba) -> impl IntoElement {
         .text_size(px(11.0))
         .text_color(color)
         .child(label)
+}
+
+fn colored_status_badge(label: &'static str, color: Rgba) -> impl IntoElement {
+    colored_badge(label, color)
 }
 
 fn empty_label(label: &str, colors: SemanticColors) -> impl IntoElement {

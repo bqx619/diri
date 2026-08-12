@@ -1176,7 +1176,9 @@ fn unknown_saved_default_repairs_to_available_first_class_then_shell() {
                 first_class: true,
                 ..AgentDescriptor::default()
             }),
+            ..AgentReadinessItem::default()
         }],
+        ..AgentReadinessResult::default()
     });
     assert_eq!(store.preferences().default_agent, AgentKind::CODEX);
 
@@ -1194,7 +1196,9 @@ fn unknown_saved_default_repairs_to_available_first_class_then_shell() {
                 first_class: false,
                 ..AgentDescriptor::default()
             }),
+            ..AgentReadinessItem::default()
         }],
+        ..AgentReadinessResult::default()
     });
     assert_eq!(store.preferences().default_agent, AgentKind::SHELL);
 }
