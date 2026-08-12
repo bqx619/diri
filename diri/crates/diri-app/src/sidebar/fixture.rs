@@ -407,6 +407,7 @@ fn project(id: &str, root: &str, name: &str) -> Project {
         root: root.into(),
         name: name.into(),
         pinned_order: None,
+        host: None,
     }
 }
 

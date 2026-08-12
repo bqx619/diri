@@ -728,6 +728,11 @@ pub struct Project {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_order: Option<i64>,
+    /// `None` means the root is local; a host id means that remote machine
+    /// owns it. Absent from records persisted by older daemons — readers fall
+    /// back to session-derived hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

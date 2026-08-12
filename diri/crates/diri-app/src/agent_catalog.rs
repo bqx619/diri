@@ -114,6 +114,24 @@ pub(crate) fn installed_agent_options(catalog: Option<&AgentReadinessResult>) ->
         .unwrap_or_else(|| vec![terminal_option()])
 }
 
+/// Whether an explicit spawn (shortcut, menu command, launcher submit) may
+/// dispatch this kind. Installed agents qualify even when hidden from quick
+/// create — menu visibility must not turn a saved default into a dead
+/// shortcut — terminals always qualify, and an unfetched catalog does not
+/// veto: availability is then unknown, and the daemon is the authority at
+/// spawn time.
+pub(crate) fn kind_spawnable(kind: &AgentKind, catalog: Option<&AgentReadinessResult>) -> bool {
+    if kind.is_terminal() {
+        return true;
+    }
+    let Some(catalog) = catalog else {
+        return true;
+    };
+    agent_options(catalog)
+        .iter()
+        .any(|option| option.available && option.kind == *kind)
+}
+
 /// Keep a saved default only while it is launchable. Removed/unknown ids fall
 /// back to an installed first-class agent, and finally to a shell session so
 /// Command-T never becomes a dead shortcut.
@@ -385,6 +403,24 @@ mod tests {
             .expect("launcher/settings options represent the repaired default");
         assert_eq!(selected.display_name, "Terminal");
         assert!(selected.available);
+    }
+
+    #[test]
+    fn quick_create_visibility_never_vetoes_an_explicit_spawn() {
+        // Installed but hidden from quick create: the saved default's ⌘T must
+        // still spawn it — menu visibility is not availability.
+        let mut hidden = item("codex", true, true);
+        hidden.show_in_quick_create = false;
+        let catalog = AgentReadinessResult {
+            agents: vec![hidden],
+            ..AgentReadinessResult::default()
+        };
+        assert!(kind_spawnable(&AgentKind::CODEX, Some(&catalog)));
+        assert!(!kind_spawnable(&AgentKind::new("absent"), Some(&catalog)));
+        // An unfetched catalog means unknown, not unavailable: the daemon's
+        // spawn-time check is the authority. Terminals are never vetoed.
+        assert!(kind_spawnable(&AgentKind::CLAUDE_CODE, None));
+        assert!(kind_spawnable(&AgentKind::SHELL, Some(&catalog)));
     }
 
     #[test]

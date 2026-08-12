@@ -82,7 +82,16 @@ pub fn actions_for_catalogs(
     default_host_id: Option<&str>,
     catalogs: &HashMap<String, AgentReadinessResult>,
 ) -> Vec<PaletteAction> {
-    let catalog = |host: Option<&str>| catalogs.get(host.unwrap_or("local"));
+    // Only the default target's catalog is warmed at connect. A host whose
+    // scan has not run yet must not lose its rows to that accident of timing —
+    // fall back to the local catalog as the optimistic guess, the way these
+    // actions were built before per-host catalogs; spawn-time discovery on
+    // the host stays the authority.
+    let catalog = |host: Option<&str>| {
+        catalogs
+            .get(host.unwrap_or("local"))
+            .or_else(|| catalogs.get("local"))
+    };
     let default_host = default_host_id.and_then(|id| hosts.iter().find(|host| host.id == id));
     let default_host_id = default_host.map(|host| host.id.as_str());
     let mut result = Vec::new();
@@ -839,12 +848,64 @@ mod tests {
     }
 
     #[test]
+    fn a_host_whose_catalog_has_not_been_fetched_keeps_its_actions() {
+        let host = HostEntry {
+            id: "forge".into(),
+            name: Some("Forge".into()),
+            ssh: "forge".into(),
+            default_cwd: None,
+            node: None,
+        };
+        // Only the local catalog is warmed at connect; forge has never been
+        // scanned. Its rows fall back to the local catalog instead of
+        // silently vanishing until some surface happens to trigger a scan.
+        let catalogs = HashMap::from([(
+            "local".to_owned(),
+            AgentReadinessResult {
+                agents: vec![installed_agent("codex", "Codex", true)],
+                ..AgentReadinessResult::default()
+            },
+        )]);
+        let actions = actions_for_catalogs(
+            AgentKind::CODEX,
+            &[ProjectTarget {
+                project: Project {
+                    id: ProjectId::new("p1"),
+                    root: "/srv/app".into(),
+                    name: "app".into(),
+                    pinned_order: None,
+                    host: Some("forge".into()),
+                },
+                host: Some("forge".into()),
+            }],
+            std::slice::from_ref(&host),
+            None,
+            None,
+            &catalogs,
+        );
+        assert!(actions.iter().any(|action| {
+            action.command
+                == PaletteCommand::SpawnAgent {
+                    agent: AgentKind::new("codex"),
+                    cwd: None,
+                    host: Some("forge".into()),
+                }
+        }));
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.title == "New Codex in app on Forge")
+        );
+    }
+
+    #[test]
     fn action_list_matches_swift_order_and_dynamic_default() {
         let project = Project {
             id: ProjectId::new("p1"),
             root: "/work/diri".into(),
             name: "diri".into(),
             pinned_order: None,
+            host: None,
         };
         let result = actions(AgentKind::CODEX, &catalog(), &[project], &[], None);
         let ids: Vec<_> = result.iter().map(|action| action.id.as_str()).collect();
@@ -1079,6 +1140,7 @@ mod tests {
             root: root.into(),
             name: name.into(),
             pinned_order: None,
+            host: None,
         }
     }
 

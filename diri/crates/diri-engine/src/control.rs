@@ -358,7 +358,7 @@ impl ControlServer {
     /// pushes event frames onto the same socket while this loop keeps
     /// answering requests — one connection carries both, as the Swift daemon's
     /// does.
-    pub fn serve(&self, stream: UnixStream) -> std::io::Result<()> {
+    pub fn serve(self: &Arc<Self>, stream: UnixStream) -> std::io::Result<()> {
         let _connection = ActiveConnectionGuard::new(Arc::clone(&self.active_connections));
         let mut reader = BufReader::new(stream.try_clone()?);
         let writer = Arc::new(Mutex::new(stream));
@@ -424,7 +424,7 @@ impl ControlServer {
     }
 
     fn handle_line(
-        &self,
+        self: &Arc<Self>,
         line: &[u8],
         writer: &Arc<Mutex<UnixStream>>,
         subscription: &mut Option<SubscriptionHandle>,
@@ -451,6 +451,43 @@ impl ControlServer {
                     id,
                     result: self.events_subscribe(params, writer, subscription),
                 })
+            }
+            ControlMessage::Request { id, method, params }
+                if (method == Method::AGENT_READINESS || method == Method::AGENT_CONFIGURE)
+                    && params
+                        .as_ref()
+                        .and_then(|value| value.get("host"))
+                        .and_then(Value::as_str)
+                        .is_some() =>
+            {
+                // A remote catalog scan can hold an SSH connection for
+                // minutes, and the app multiplexes every RPC over this one
+                // connection; answering inline would stall spawns, kills, and
+                // list refreshes behind an unreachable host. The scan runs on
+                // its own thread and writes its response when done — clients
+                // match responses by id, and per-target single-flight inside
+                // `agent_catalog` keeps concurrent scans deduplicated. Local
+                // scans stay inline: they are PATH lookups, not connections.
+                let server = Arc::clone(self);
+                let writer = Arc::clone(writer);
+                let spawned = std::thread::Builder::new()
+                    .name("dirijord-agent-scan".into())
+                    .spawn(move || {
+                        let response = ControlMessage::Response {
+                            id,
+                            result: server.dispatch(&method, params),
+                        };
+                        let _ = write_message(&writer, &response);
+                    });
+                match spawned {
+                    Ok(_) => None,
+                    Err(error) => Some(ControlMessage::Response {
+                        id,
+                        result: Err(ControlError::internal(format!(
+                            "could not start the catalog scan: {error}"
+                        ))),
+                    }),
+                }
             }
             ControlMessage::Request { id, method, params } => Some(ControlMessage::Response {
                 id,
@@ -2034,11 +2071,19 @@ impl ControlServer {
             .lock()
             .map_err(poisoned)?
             .preference(None, kind);
-        let resolution =
-            crate::agent_catalog::resolve_local(binary, preference.executable_path.as_deref());
+        // Only an explicit user-configured path overrides the manifest. With
+        // no override the binary deliberately stays bare: `spawn_spec` either
+        // hands it to a fresh interactive login shell (which resolves the
+        // nvm/mise/Homebrew PATH the daemon never inherited) or absolutizes
+        // it against the spawn environment. Judging availability by the
+        // daemon's own PATH here would reject agents the login shell can
+        // launch, and pin versions to whatever the daemon saw at startup.
+        let Some(configured) = preference.executable_path.as_deref() else {
+            return Ok(binary.to_owned());
+        };
+        let resolution = crate::agent_catalog::resolve_local(binary, Some(configured));
         resolution
             .configured_path
-            .or(resolution.detected_path)
             .ok_or_else(|| agent_unavailable(kind, None, resolution.configured_error.as_deref()))
     }
 
@@ -3157,9 +3202,12 @@ mod tests {
         Arc::new(engine)
     }
 
-    fn server(temp: &Path) -> ControlServer {
+    fn server(temp: &Path) -> Arc<ControlServer> {
         let registry = Registry::new(engine(), temp.join("state.json"));
-        ControlServer::new(Arc::new(Mutex::new(registry)), temp.join("daemon.sock"))
+        Arc::new(ControlServer::new(
+            Arc::new(Mutex::new(registry)),
+            temp.join("daemon.sock"),
+        ))
     }
 
     fn test_record(id: &str) -> diri_proto::SessionRecord {
@@ -3199,12 +3247,16 @@ mod tests {
     /// Round-trips one request through the dispatcher the way a client would.
     /// Dispatches one line the way `serve` would, with a throwaway socket
     /// standing in for the connection's write half.
-    fn handle(server: &ControlServer, line: &[u8]) -> Option<ControlMessage> {
+    fn handle(server: &Arc<ControlServer>, line: &[u8]) -> Option<ControlMessage> {
         let (writer, _peer) = UnixStream::pair().expect("socketpair");
         server.handle_line(line, &Arc::new(Mutex::new(writer)), &mut None)
     }
 
-    fn call(server: &ControlServer, method: &str, params: Option<JsonValue>) -> ControlMessage {
+    fn call(
+        server: &Arc<ControlServer>,
+        method: &str,
+        params: Option<JsonValue>,
+    ) -> ControlMessage {
         let request = ControlMessage::Request {
             id: 1,
             method: method.into(),
@@ -3351,6 +3403,48 @@ mod tests {
         );
     }
 
+    /// Without a manual path the manifest's binary stays bare: the interactive
+    /// login shell (or `spawn_spec`'s PATH absolutization) resolves it at
+    /// launch against nvm/mise/Homebrew PATHs the daemon never inherited.
+    /// Pre-judging availability by the daemon's own PATH would hard-fail
+    /// spawns the login shell can serve, and pin versions to daemon startup.
+    #[test]
+    fn local_spawns_keep_the_bare_binary_unless_a_path_is_configured() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        assert_eq!(
+            server
+                .resolve_local_agent_executable("claude-code", "not-on-the-daemon-path")
+                .expect("a bare binary is not pre-judged by the daemon's PATH"),
+            "not-on-the-daemon-path"
+        );
+
+        let configured = temp.path().join("claude");
+        std::fs::write(&configured, b"#!/bin/sh\nexit 0\n").expect("fake claude executable");
+        std::fs::set_permissions(&configured, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake claude executable");
+        server
+            .agent_catalog
+            .lock()
+            .expect("agent catalog lock")
+            .configure(
+                None,
+                "claude-code",
+                crate::agent_catalog::AgentPreference {
+                    executable_path: Some(configured.to_string_lossy().into_owned()),
+                    show_in_quick_create: Some(true),
+                },
+            )
+            .expect("bind fake claude executable");
+        assert_eq!(
+            server
+                .resolve_local_agent_executable("claude-code", "claude")
+                .expect("configured path wins"),
+            configured.to_string_lossy()
+        );
+    }
+
     /// An agent that dies on its own — a dropped ssh, a crash — leaves its
     /// session in the registry, because only an explicit kill takes one out.
     /// Resume used to read that presence as "already live", call itself a
@@ -3428,7 +3522,10 @@ mod tests {
             "the premise: a dead agent's session stays in the registry"
         );
 
-        let server = ControlServer::new(Arc::clone(&registry), temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
         let result = ok_of(call(
             &server,
             "session.resume",
@@ -3500,7 +3597,10 @@ mod tests {
             .lock()
             .expect("registry")
             .insert_record(test_record("s_rec"));
-        let server = ControlServer::new(registry, temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            registry,
+            temp.path().join("daemon.sock"),
+        ));
 
         let params = json!({ "sessionID": "s_rec", "title": "renamed by hand" });
         ok_of(call(&server, "session.rename", Some(params)));
@@ -3555,7 +3655,10 @@ mod tests {
             .lock()
             .expect("registry")
             .insert_record(test_record("s_hook"));
-        let server = ControlServer::new(registry, temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            registry,
+            temp.path().join("daemon.sock"),
+        ));
 
         ok_of(call(
             &server,
@@ -3642,7 +3745,10 @@ mod tests {
             .lock()
             .expect("registry")
             .insert_record(test_record("s_gone"));
-        let server = ControlServer::new(registry, temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            registry,
+            temp.path().join("daemon.sock"),
+        ));
 
         ok_of(call(
             &server,
@@ -3692,7 +3798,10 @@ mod tests {
         let mut record = test_record("s_diff");
         record.cwd = repo.to_string_lossy().into_owned();
         registry.lock().expect("registry").insert_record(record);
-        let server = ControlServer::new(registry, temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            registry,
+            temp.path().join("daemon.sock"),
+        ));
 
         let result = ok_of(call(
             &server,

@@ -65,6 +65,7 @@ fn project(value: &str, name: &str) -> Project {
         root: format!("/work/{value}"),
         name: name.to_owned(),
         pinned_order: None,
+        host: None,
     }
 }
 
@@ -1201,6 +1202,54 @@ fn unknown_saved_default_repairs_to_available_first_class_then_shell() {
         ..AgentReadinessResult::default()
     });
     assert_eq!(store.preferences().default_agent, AgentKind::SHELL);
+}
+
+#[test]
+fn a_configure_issued_during_an_inflight_scan_still_reaches_the_engine() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    store.request_agent_catalog(Some("forge".into()), false);
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::RefreshAgents { .. })
+    ));
+    // The scan has not answered yet. A settings toggle flipped in that window
+    // is a user mutation, not a cache refresh — dropping it would silently
+    // revert the control on the next catalog paint.
+    store.configure_agent(diri_proto::AgentConfigureParams {
+        host: Some("forge".into()),
+        kind: AgentKind::CLAUDE_CODE,
+        executable_path: None,
+        show_in_quick_create: false,
+    });
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::ConfigureAgent(_))
+    ));
+}
+
+#[test]
+fn a_failed_scan_is_retried_only_by_an_explicit_rescan() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    store.request_agent_catalog(Some("forge".into()), false);
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::RefreshAgents { .. })
+    ));
+    // The effect loop reports the failure: loading cleared, error recorded.
+    store.agent_catalog_loading.remove("forge");
+    store
+        .agent_catalog_errors
+        .insert("forge".into(), "ssh: connect timed out".into());
+    // Render paths ask again on every paint of a surface whose catalog is
+    // absent; after a failure that must not become a scan loop against an
+    // unreachable host.
+    store.request_agent_catalog(Some("forge".into()), false);
+    assert!(effects.try_recv().is_err());
+    store.request_agent_catalog(Some("forge".into()), true);
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::RefreshAgents { force: true, .. })
+    ));
 }
 
 #[test]

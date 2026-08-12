@@ -2192,9 +2192,11 @@ impl UtilitySurfaces {
         let selected = self.prefs.default_agent.clone();
         let agents = {
             let store = self.store.read().expect("session store lock poisoned");
-            crate::agent_catalog::installed_agent_options(
-                store.agent_catalog(store.default_spawn_host().as_deref()),
-            )
+            // The default agent is a global preference repaired against the
+            // local catalog (see set_agent_catalog); listing the default spawn
+            // host's catalog instead would let a remote host's thinner install
+            // set — or its not-yet-fetched catalog — shrink the choices.
+            crate::agent_catalog::installed_agent_options(store.agent_catalog(None))
         };
         let selected_label = agents
             .iter()

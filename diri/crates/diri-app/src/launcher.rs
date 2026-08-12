@@ -198,26 +198,27 @@ impl LauncherOverlay {
     /// Keeps a saved default preference intact while making this invocation
     /// usable on a target where that Agent is absent. It runs only after a
     /// catalog exists, so an in-flight remote scan never causes a false
-    /// fallback or visual jump.
+    /// fallback or visual jump; and it judges by installed state, not quick
+    /// create visibility, so a hidden-but-installed default is not switched
+    /// away from.
     fn reconcile_harness(&mut self) {
-        let has_catalog = self
-            .services
-            .store
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .agent_catalog(self.selected_host.as_deref())
-            .is_some();
-        if !has_catalog {
+        let spawnable = {
+            let store = self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            let catalog = store.agent_catalog(self.selected_host.as_deref());
+            if catalog.is_none() {
+                return;
+            }
+            crate::agent_catalog::kind_spawnable(&self.selected_harness, catalog)
+        };
+        if spawnable {
             return;
         }
         let choices = self.harness_choices();
-        if choices
-            .iter()
-            .any(|choice| choice.kind == self.selected_harness)
-        {
-            return;
-        }
         let Some(first) = choices.first() else {
             return;
         };
@@ -241,11 +242,18 @@ impl LauncherOverlay {
             .values()
             .cloned()
             .map(|project| LauncherProject {
-                host: store
-                    .sessions()
-                    .values()
-                    .find(|session| session.project_id == project.id)
-                    .and_then(|session| session.host.clone()),
+                // The project record is the authority for which machine owns
+                // the root; sessions are a fallback for records persisted by
+                // daemons that predate the host field. Without it, a remote
+                // project whose sessions were all closed would spawn locally
+                // with the remote path as cwd.
+                host: project.host.clone().or_else(|| {
+                    store
+                        .sessions()
+                        .values()
+                        .find(|session| session.project_id == project.id)
+                        .and_then(|session| session.host.clone())
+                }),
                 project,
             })
             .collect();
@@ -296,19 +304,29 @@ impl LauncherOverlay {
         if self.selected_root.is_empty() {
             return Some("Choose a project to start in".to_owned());
         }
-        self.harness_choices()
-            .into_iter()
-            .any(|choice| choice.kind == self.selected_harness)
-            .then_some(())
-            .map_or_else(
-                || {
-                    Some(format!(
-                        "{} is not available on this host",
-                        self.selected_harness_label()
-                    ))
-                },
-                |_| None,
-            )
+        let spawnable = {
+            let store = self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            let catalog = store.agent_catalog(self.selected_host.as_deref());
+            // No catalog means a scan is in flight or failed, not that the
+            // Agent is absent: submitting stays possible and the daemon's
+            // spawn-time check remains the authority. Claiming "not
+            // available" here would block ⌘↵ for the length of an SSH scan —
+            // or forever, when the scan errored.
+            crate::agent_catalog::kind_spawnable(&self.selected_harness, catalog)
+        };
+        if spawnable {
+            None
+        } else {
+            Some(format!(
+                "{} is not available on this host",
+                self.selected_harness_label()
+            ))
+        }
     }
 
     fn can_submit(&self) -> bool {

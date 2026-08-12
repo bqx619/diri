@@ -1554,6 +1554,7 @@ mod tests {
                     root: "/work/overview".into(),
                     name: "Overview".into(),
                     pinned_order: None,
+                    host: None,
                 }],
             });
         runtime

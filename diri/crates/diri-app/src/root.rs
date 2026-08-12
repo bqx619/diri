@@ -828,11 +828,10 @@ impl RootView {
         match agent {
             Some(agent) => {
                 let host = store.default_spawn_host();
-                let available =
-                    crate::agent_catalog::quick_agent_options(store.agent_catalog(host.as_deref()))
-                        .iter()
-                        .any(|item| item.kind == agent);
-                if !available {
+                if !crate::agent_catalog::kind_spawnable(
+                    &agent,
+                    store.agent_catalog(host.as_deref()),
+                ) {
                     store.request_agent_catalog(host, false);
                     return false;
                 }
@@ -861,11 +860,7 @@ impl RootView {
             .expect("session store lock poisoned");
         let host = store.default_spawn_host();
         let kind = store.preferences().default_agent.clone();
-        let available =
-            crate::agent_catalog::quick_agent_options(store.agent_catalog(host.as_deref()))
-                .iter()
-                .any(|agent| agent.kind == kind);
-        if !available {
+        if !crate::agent_catalog::kind_spawnable(&kind, store.agent_catalog(host.as_deref())) {
             store.request_agent_catalog(host, false);
             return false;
         }

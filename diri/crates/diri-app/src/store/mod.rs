@@ -376,16 +376,26 @@ impl SessionStore {
 
     pub fn request_agent_catalog(&mut self, host: Option<String>, force: bool) {
         let key = agent_target_key(host.as_deref());
+        // A failed scan leaves the catalog absent, and the failure's change
+        // broadcast re-renders the surfaces that ask for absent catalogs; a
+        // non-forced request after an error would therefore retry in a loop
+        // for as long as such a surface stays open. Only an explicit rescan
+        // gets past a recorded failure.
+        if !force && self.agent_catalog_errors.contains_key(&key) {
+            return;
+        }
         if self.agent_catalog_loading.insert(key) {
             self.emit(StoreEffect::RefreshAgents { host, force });
         }
     }
 
     pub fn configure_agent(&mut self, params: diri_proto::AgentConfigureParams) {
-        let key = agent_target_key(params.host.as_deref());
-        if self.agent_catalog_loading.insert(key) {
-            self.emit(StoreEffect::ConfigureAgent(params));
-        }
+        // Configuration is a user mutation, not a cache refresh: it must reach
+        // the engine even while a scan for the same target is in flight, or a
+        // toggle flipped during a slow remote scan silently reverts.
+        self.agent_catalog_loading
+            .insert(agent_target_key(params.host.as_deref()));
+        self.emit(StoreEffect::ConfigureAgent(params));
     }
 
     pub fn agent_catalog_is_loading(&self, host: Option<&str>) -> bool {
@@ -2481,11 +2491,18 @@ async fn run_effects(
                         })
                         .await;
                     let mut locked = store.write().expect("session store lock poisoned");
+                    let key = agent_target_key(host.as_deref());
+                    // Clear the requested key, not the one the response names:
+                    // a daemon too old for per-host params echoes no host, and
+                    // keying off the response would leave this target loading
+                    // (and every further request suppressed) forever.
+                    locked.agent_catalog_loading.remove(&key);
                     match result {
-                        Ok(catalog) => locked.set_agent_catalog(catalog),
+                        Ok(catalog) => {
+                            locked.agent_catalog_errors.remove(&key);
+                            locked.set_agent_catalog(catalog);
+                        }
                         Err(error) => {
-                            let key = agent_target_key(host.as_deref());
-                            locked.agent_catalog_loading.remove(&key);
                             locked.agent_catalog_errors.insert(key, error.to_string());
                         }
                     }
@@ -2501,11 +2518,15 @@ async fn run_effects(
                     let host = params.host.clone();
                     let result = client.configure_agent(params).await;
                     let mut locked = store.write().expect("session store lock poisoned");
+                    let key = agent_target_key(host.as_deref());
+                    // Requested key, not response key — see RefreshAgents.
+                    locked.agent_catalog_loading.remove(&key);
                     match result {
-                        Ok(catalog) => locked.set_agent_catalog(catalog),
+                        Ok(catalog) => {
+                            locked.agent_catalog_errors.remove(&key);
+                            locked.set_agent_catalog(catalog);
+                        }
                         Err(error) => {
-                            let key = agent_target_key(host.as_deref());
-                            locked.agent_catalog_loading.remove(&key);
                             locked.agent_catalog_errors.insert(key, error.to_string());
                         }
                     }
