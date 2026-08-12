@@ -3308,6 +3308,8 @@ mod tests {
 
     #[test]
     fn resuming_an_agent_directly_executes_the_agent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let temp = tempfile::tempdir().expect("temp");
         let registry = Registry::new(engine(), temp.path().join("state.json"));
         let server = ControlServer::new(
@@ -3317,6 +3319,23 @@ mod tests {
             ))),
             temp.path().join("daemon.sock"),
         );
+        let executable = temp.path().join("claude");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").expect("fake claude executable");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake claude executable");
+        server
+            .agent_catalog
+            .lock()
+            .expect("agent catalog lock")
+            .configure(
+                None,
+                "claude-code",
+                crate::agent_catalog::AgentPreference {
+                    executable_path: Some(executable.to_string_lossy().into_owned()),
+                    show_in_quick_create: Some(true),
+                },
+            )
+            .expect("bind fake claude executable");
 
         let spec = server
             .resume_spec(&registry, "s_resume", "claude-code", "/tmp", Some("uuid-1"))
@@ -3326,7 +3345,8 @@ mod tests {
         // have to reach the agent itself.
         let command = spec.pty.argv.last().expect("argv");
         assert!(
-            command.contains("claude'") && command.contains("'--resume' 'uuid-1'"),
+            command.contains(&format!("{}'", executable.display()))
+                && command.contains("'--resume' 'uuid-1'"),
             "resume flags must reach the agent: {command:?}"
         );
     }
